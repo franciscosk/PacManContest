@@ -4,9 +4,9 @@
     "food_eaten": 2.0,
     "stop": -5.0,
     "reverse": -0.5,
-    "distance_to_food": -3.445073373866321,
-    "distance_to_ghost": 1.809205073005237,
-    "invader_distance": -2.6244764210050113,
-    "num_invaders": -0.656797749879814,
-    "food_remaining": -1.2127632449279864
+    "distance_to_food": -3.440152621987652,
+    "distance_to_ghost": 0.231486683521024,
+    "invader_distance": -3.0378168911445975,
+    "num_invaders": -0.9806967750394344,
+    "food_remaining": -1.1996972328584277
 }

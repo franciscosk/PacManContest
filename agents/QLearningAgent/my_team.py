@@ -12,7 +12,15 @@ from contest.util import nearest_point
 
 NUM_TRAINING = 0
 TRAINING = False
+####
 
+# COMMAND
+
+
+# python capture.py -r ../../agents/QLearningAgent/my_team.py -b baseline_team.py  -n 20  --delay-step 0 -l RANDOM
+
+
+####
 
 def create_team(first_index, second_index, is_red,
                 first='ApproxQLearningOffense', second='DefensiveReflexAgent', num_training=0, **args):

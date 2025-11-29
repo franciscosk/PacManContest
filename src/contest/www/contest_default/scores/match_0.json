@@ -3,15 +3,15 @@
         [
             "Red",
             "Blue",
-            "layouts\\defaultCapture.lay",
-            3,
+            "RANDOM22558082",
+            21,
             "Red",
-            53.0,
+            52.0,
             0
         ]
     ],
     "layouts": [
-        "layouts\\defaultCapture.lay"
+        "RANDOM22558082"
     ],
     "max_steps": 1200,
     "teams_stats": {
@@ -31,7 +31,7 @@
             0,
             0,
             0,
-            3
+            21
         ]
     }
 }
