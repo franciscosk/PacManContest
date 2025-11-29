@@ -1,370 +1,178 @@
 # my_team.py
-# ---------
+# ---------------
 # Licensing Information:  You are free to use or extend these projects for
 # educational purposes provided that (1) you do not distribute or publish
 # solutions, (2) you retain this notice, and (3) you provide clear
 # attribution to UC Berkeley, including a link to http://ai.berkeley.edu.
+#
+# Attribution Information: The Pacman AI projects were developed at UC Berkeley.
+# The core projects and autograders were primarily created by John DeNero
+# (denero@cs.berkeley.edu) and Dan Klein (klein@cs.berkeley.edu).
+# Student side autograding was added by Brad Miller, Nick Hay, and
+# Pieter Abbeel (pabbeel@cs.berkeley.edu).
 
 import random
 import util
+import json
+from pathlib import Path
 from capture_agents import CaptureAgent
 from game import Directions
 from util import nearest_point
-from pathlib import Path
 
 #################
 # Team creation #
 #################
 
-# File path for weights
-WEIGHTS_FILE_PATH = Path(__file__).parent / 'weights.txt'
-
 
 def create_team(first_index, second_index, is_red,
-                first='OffensiveReflexQAgent', second='DefensiveReflexAgent', num_training=0):
+                first='SmartQAgent', second='SmartQAgent', num_training=0):
     """
-    Entry point called by the capture framework.
+    Returns a list of two agents that will form the team.
     """
-    return [eval(first)(first_index, num_training=num_training),
-            # rEFLEX AGENT doesnt have num_training [param] yet
-            eval(second)(second_index)]
-
+    return [eval(first)(first_index, num_training), eval(second)(second_index, num_training)]
 
 ##########
 # Agents #
 ##########
 
 
-class ApproximateQAgent(CaptureAgent):
+class SmartQAgent(CaptureAgent):
     """
-    Generic approximate Q-learning agent.
+    STABILIZED Q-Learning Agent.
+    Prevents weight explosion via:
+    1. Feature Normalization (0.0 to 1.0)
+    2. Weight Clamping (Hard limits)
+    3. Small Rewards
     """
 
-    def __init__(self, index, time_for_computing=.1, num_training=0,
-                 epsilon=0.1, alpha=0.2, gamma=0.8):
-        CaptureAgent.__init__(self, index, time_for_computing)
-        self.episodes_so_far = 0
-        self.num_training = int(num_training)
-        self.epsilon = float(epsilon)
-        self.alpha = float(alpha)
-        self.discount = float(gamma)
+    def __init__(self, index, time_for_computing=.1):
+        super().__init__(index, time_for_computing)
+        self.epsilon = 0.05
+        self.alpha = 0.1     # REDUCED: Lower learning rate for stability
+        self.discount = 0.8
+        self.episodes_so_far = 0  # <--- Initialize the game counter here
 
-        # Linear function approximation weights
+        self.won_games = 0
+        self.lost_games = 0
+        self.scores = []
+
+        self.weights_file = Path(__file__).parent / "weights.txt"
         self.weights = util.Counter()
 
-        # Small bit of memory to detect oscillations / revisits
-        self.last_positions = []
-        self.max_position_history = 6
+        # Heuristics that should not change
+        self.frozen_weights = ['stop', 'reverse', 'bias', 'on_defense']
 
-    def assert_finite_counter(self, counter, label):
-        import math
-        for k, v in counter.items():
-            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-                raise ValueError(f"{label} has bad value: {k} = {v}")
+        self.load_weights()
 
     def register_initial_state(self, game_state):
-
-        CaptureAgent.register_initial_state(self, game_state)
         self.start = game_state.get_agent_position(self.index)
-        self.last_positions = [self.start]
+        CaptureAgent.register_initial_state(self, game_state)
+        self.last_state = None
+        self.last_action = None
+        # Cache grid size for normalization
+        self.map_area = game_state.data.layout.width * game_state.data.layout.height
 
-        # --- WEIGHT LOADING LOGIC ---
-        loaded = False
+    def load_weights(self):
+        if self.weights_file.exists():
+            try:
+                with open(self.weights_file, 'r') as f:
+                    data = json.load(f)
+                    for k, v in data.items():
+                        self.weights[k] = float(v)  # Ensure float
+            except:
+                self.initialize_weights()
+        else:
+            self.initialize_weights()
+
+    def initialize_weights(self):
+        # Initialize with sane, small numbers
+        self.weights['bias'] = 1.0
+        self.weights['score'] = 0.5
+        self.weights['food_eaten'] = 2.0
+        self.weights['stop'] = -5.0
+        self.weights['reverse'] = -0.5
+        self.weights['distance_to_food'] = -1.5
+        self.weights['distance_to_ghost'] = 2.0
+        self.weights['invader_distance'] = -2.0
+        self.weights['num_invaders'] = -50.0
+
+    def save_weights(self):
         try:
-            if WEIGHTS_FILE_PATH.exists():
-                with open(WEIGHTS_FILE_PATH, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                if content:
-                    self.weights = util.Counter(eval(content))
-                    loaded = True
-        except OSError:
+            with open(self.weights_file, 'w') as f:
+                json.dump(self.weights, f, indent=4)
+        except:
             pass
-
-        if not loaded or len(self.weights) == 0:
-            self.weights = self.get_initial_weights()
-            print(f"[ApproxQ] Using initial weights: {self.weights}")
-        else:
-            print(f"[ApproxQ] Loaded weights: {self.weights}")
-
-        # *** NEW: sanity check ***
-        self.assert_finite_counter(self.weights, "weights after load")
-
-    def final(self, game_state):
-        CaptureAgent.final(self, game_state)
-        self.episodes_so_far += 1
-
-        # --- SAVING LOGIC ENABLED FOR TRAINING ---
-        print(f"New weights: {self.weights}")
-        if self.num_training > 0:
-            print("Saving weights to file...")
-            # Only save occasionally to avoid file corruption if interrupted,
-            # or save at the very end.
-            with open(WEIGHTS_FILE_PATH, 'w', encoding='utf-8') as f:
-                f.write(str(self.weights))
-
-    def get_initial_weights(self):
-        return util.Counter()
-
-    def get_features(self, game_state, action):
-        return util.Counter()
-
-    def get_reward(self, game_state, next_state):
-        return 0.0
-
-    def get_q_value(self, game_state, action):
-        features = self.get_features(game_state, action)
-        return self.weights * features
-
-    def get_value(self, game_state):
-        actions = game_state.get_legal_actions(self.index)
-        if not actions:
-            return 0.0
-        return max(self.get_q_value(game_state, a) for a in actions)
-
-    def get_policy(self, game_state):
-        actions = game_state.get_legal_actions(self.index)
-        if not actions:
-            return None
-        values = [self.get_q_value(game_state, a) for a in actions]
-        best_value = max(values)
-        best_actions = [a for a, v in zip(actions, values) if v == best_value]
-
-        if len(best_actions) == 0:
-            return random.choice(actions)
-
-        return random.choice(best_actions)
-
-    def choose_action(self, game_state):
-        legal_actions = game_state.get_legal_actions(self.index)
-        if not legal_actions:
-            return Directions.STOP
-
-        exploring = self.episodes_so_far < self.num_training
-        if exploring and random.random() < self.epsilon:
-            action = random.choice(legal_actions)
-        else:
-            action = self.get_policy(game_state)
-
-        if exploring:
-            self.update_weights(game_state, action)
-
-        successor = self.get_successor(game_state, action)
-        next_pos = successor.get_agent_state(self.index).get_position()
-        if next_pos is not None:
-            self.last_positions.append(next_pos)
-            if len(self.last_positions) > self.max_position_history:
-                self.last_positions.pop(0)
-
-        return action
-
-    def update_weights(self, game_state, action):
-        next_state = self.get_successor(game_state, action)
-        reward = self.get_reward(game_state, next_state)
-        features = self.get_features(game_state, action)
-        current_q = self.get_q_value(game_state, action)
-        future_q = self.get_value(next_state)
-
-        difference = (reward + self.discount * future_q) - current_q
-
-        # --- FROZEN FEATURES LOGIC ---
-        # These weights will NEVER change during training.
-        frozen_features = ['ghost_1_step',
-                           'ghost_2_steps', 'trapped_location', 'stop']
-
-        for f in features:
-            if f not in frozen_features:
-                self.weights[f] += self.alpha * difference * features[f]
-
-    def get_successor(self, game_state, action):
-        successor = game_state.generate_successor(self.index, action)
-        pos = successor.get_agent_state(self.index).get_position()
-        if pos != nearest_point(pos):
-            successor = successor.generate_successor(self.index, action)
-        return successor
-
-
-# ----------------------------------------------------------------------
-# OFFENSIVE AGENT
-# ----------------------------------------------------------------------
-
-class OffensiveReflexQAgent(ApproximateQAgent):
-    """
-    Improved Offensive Agent with "Shaping" for training.
-    Safety weights are frozen. Strategy weights are learnable.
-    """
-
-    def get_initial_weights(self):
-        w = util.Counter()
-        w['bias'] = 0.0
-
-        # --- LEARNABLE WEIGHTS (Strategy) ---
-        # We start these at reasonable guesses, but let the agent tune them.
-        w['closest_food'] = -2.0
-        w['eat_food'] = 20.0
-        # Start neutral, let it learn if carrying is good/bad
-        w['carrying'] = 0.0
-        w['go_home'] = -5.0             # Distance penalty to home
-        w['eat_capsule'] = 50.0
-        w['ghost_far'] = 0.0
-        w['reverse'] = -2.0
-        w['revisit'] = -5.0
-
-        # --- FROZEN WEIGHTS (Safety - DO NOT CHANGE) ---
-        # These are critical for survival. We do not want the agent to "experiment" with these.
-        w['ghost_1_step'] = -1000.0
-        w['ghost_2_steps'] = -1000.0
-        w['trapped_location'] = -5000.0
-        w['stop'] = -100.0
-
-        return w
 
     def get_features(self, game_state, action):
         features = util.Counter()
-
         successor = self.get_successor(game_state, action)
+        features['bias'] = 1.0
+
         my_state = successor.get_agent_state(self.index)
         my_pos = my_state.get_position()
 
-        # 0. Bias
-        features['bias'] = 1.0
+        # --- NORMALIZATION CONSTANTS ---
+        # We divide distances by map_area or max_width to keep features < 1.0
+        max_dist = self.map_area / 2.0
 
-        # 1. Food
-        food_list = self.get_food(successor).as_list()
-        features['closest_food'] = 0.0
-        if len(food_list) > 0:
-            min_dist = min(self.get_maze_distance(my_pos, f)
-                           for f in food_list)
-            features['closest_food'] = float(min_dist)
+        if action == Directions.STOP:
+            features['stop'] = 1
+        rev = Directions.REVERSE[game_state.get_agent_state(
+            self.index).configuration.direction]
+        if action == rev:
+            features['reverse'] = 1
 
-        # 2. Eat Food (Reward for decreasing food count)
-        current_food = self.get_food(game_state).as_list()
-        if len(food_list) < len(current_food):
-            features['eat_food'] = 1.0
-
-        # 3. Carrying logic & Retreat
-        # We define a "retreat" condition to encourage going home.
-        should_retreat = False
-        carrying_amt = my_state.num_carrying
-        timeleft = game_state.data.timeleft
-
-        # Retreat if we have 2+ dots, or 1 dot and time is short
-        if carrying_amt >= 2:
-            should_retreat = True
-        elif carrying_amt > 0 and timeleft < 100:
-            should_retreat = True
-
-        if should_retreat:
-            dist_home = self.get_maze_distance(my_pos, self.start)
-            features['go_home'] = float(dist_home)
-            # If retreating, minimize the urge to go deeper for food
-            features['closest_food'] = 0.0
-
-        # 4. Ghost handling & Trapped Logic
+        current_score = self.get_score(game_state)
         enemies = [successor.get_agent_state(i)
                    for i in self.get_opponents(successor)]
-        defenders = [a for a in enemies if (
-            not a.is_pacman) and a.get_position() is not None]
+        invaders = [
+            a for a in enemies if a.is_pacman and a.get_position() is not None]
+        defenders = [
+            a for a in enemies if not a.is_pacman and a.get_position() is not None]
 
-        features['ghost_1_step'] = 0.0
-        features['ghost_2_steps'] = 0.0
-        features['trapped_location'] = 0.0
+        # 1. CAMPING (Winning > 2)
+        if current_score > 2:
+            features['on_defense'] = 1
+            if my_state.is_pacman:
+                features['on_defense'] = 0
 
-        if defenders:
-            dists = [self.get_maze_distance(
-                my_pos, a.get_position()) for a in defenders]
-            min_ghost_dist = min(dists)
-            scared = any(a.scared_timer > 0 for a in defenders)
+            features['num_invaders'] = len(invaders)
+            if len(invaders) > 0:
+                dists = [self.get_maze_distance(
+                    my_pos, a.get_position()) for a in invaders]
+                # NORMALIZE: 0.0 to 1.0
+                features['invader_distance'] = min(dists) / max_dist
 
-            if not scared:
-                # Standard avoidance
-                if min_ghost_dist <= 1:
-                    features['ghost_1_step'] = 1.0
-                elif min_ghost_dist <= 3:
-                    features['ghost_2_steps'] = 1.0
+        # 2. OFFENSE / RECOVERY
+        else:
+            if len(invaders) > 0:
+                features['num_invaders'] = len(invaders)
+                dists = [self.get_maze_distance(
+                    my_pos, a.get_position()) for a in invaders]
+                features['invader_distance'] = min(dists) / max_dist
+                features['on_defense'] = 1 if not my_state.is_pacman else 0
 
-                # Dead-end detection ("Trapped")
-                if min_ghost_dist <= 5:
-                    # Check legal moves from the successor state
-                    next_actions = successor.get_legal_actions(self.index)
-                    move_options = [
-                        a for a in next_actions if a != Directions.STOP]
+            else:
+                food_list = self.get_food(successor).as_list()
+                # DO NOT use raw score here. Use food count fraction.
+                features['food_remaining'] = len(food_list) / 100.0
 
-                    # If we have 1 or fewer exits, it's a dead end
-                    if len(move_options) <= 1:
-                        features['trapped_location'] = 1.0
+                if len(food_list) > 0:
+                    min_dist = min([self.get_maze_distance(my_pos, food)
+                                   for food in food_list])
+                    features['distance_to_food'] = min_dist / max_dist
 
-        # 5. Capsules
-        capsules_before = self.get_capsules(game_state)
-        capsules_after = self.get_capsules(successor)
-        if len(capsules_after) < len(capsules_before):
-            features['eat_capsule'] = 1.0
-
-        # 6. Movement Penalties
-        if action == Directions.STOP:
-            features['stop'] = 1.0
-
-        current_direction = game_state.get_agent_state(
-            self.index).configuration.direction
-        if current_direction != Directions.STOP:
-            reverse_dir = Directions.REVERSE[current_direction]
-            if action == reverse_dir:
-                features['reverse'] = 1.0
-
-        if my_pos in self.last_positions:
-            features['revisit'] = 1.0
+                if len(defenders) > 0:
+                    dists = [self.get_maze_distance(
+                        my_pos, a.get_position()) for a in defenders]
+                    min_ghost_dist = min(dists)
+                    if min_ghost_dist < 5:
+                        if my_state.is_pacman:
+                            # Inverse distance proxy (max 1.0)
+                            features['distance_to_ghost'] = - \
+                                1.0 + (min_ghost_dist / 10.0)
 
         return features
-
-    def get_reward(self, game_state, next_state):
-        reward = 0.0
-        my_prev = game_state.get_agent_state(self.index)
-        my_next = next_state.get_agent_state(self.index)
-
-        # Returning food is the ultimate goal
-        if my_next.num_returned > my_prev.num_returned:
-            reward += 100.0 * (my_next.num_returned - my_prev.num_returned)
-
-        # Dying is bad
-        if my_prev.num_carrying > 0 and my_next.num_carrying == 0:
-            if next_state.get_agent_position(self.index) == self.start:
-                reward -= 100.0
-
-        return reward
-
-
-# ----------------------------------------------------------------------
-# DEFENSIVE AGENT
-# ----------------------------------------------------------------------
-class ReflexCaptureAgent(CaptureAgent):
-    def __init__(self, index, time_for_computing=.1):
-        super().__init__(index, time_for_computing)
-        self.start = None
-
-    def register_initial_state(self, game_state):
-        self.start = game_state.get_agent_position(self.index)
-        CaptureAgent.register_initial_state(self, game_state)
-
-    def choose_action(self, game_state):
-        actions = game_state.get_legal_actions(self.index)
-        values = [self.evaluate(game_state, a) for a in actions]
-        max_value = max(values)
-        best_actions = [a for a, v in zip(actions, values) if v == max_value]
-
-        # Hardcoded Defense Logic: if food is scarce, guard the border tightly
-        food_left = len(self.get_food(game_state).as_list())
-        if food_left <= 2:
-            best_dist = 9999
-            best_action = None
-            for action in actions:
-                successor = self.get_successor(game_state, action)
-                pos2 = successor.get_agent_position(self.index)
-                dist = self.get_maze_distance(self.start, pos2)
-                if dist < best_dist:
-                    best_action = action
-                    best_dist = dist
-            return best_action
-
-        return random.choice(best_actions)
 
     def get_successor(self, game_state, action):
         successor = game_state.generate_successor(self.index, action)
@@ -374,50 +182,109 @@ class ReflexCaptureAgent(CaptureAgent):
         else:
             return successor
 
-    def evaluate(self, game_state, action):
+    def get_q_value(self, game_state, action):
         features = self.get_features(game_state, action)
-        weights = self.get_weights(game_state, action)
-        return features * weights
+        return features * self.weights
 
-    def get_features(self, game_state, action):
-        features = util.Counter()
-        successor = self.get_successor(game_state, action)
-        features['successor_score'] = self.get_score(successor)
-        return features
+    def compute_value_from_q_values(self, game_state):
+        allowed = game_state.get_legal_actions(self.index)
+        if not allowed:
+            return 0.0
+        return max([self.get_q_value(game_state, a) for a in allowed])
 
-    def get_weights(self, game_state, action):
-        return {'successor_score': 1.0}
+    def compute_action_from_q_values(self, game_state):
+        allowed = game_state.get_legal_actions(self.index)
+        if not allowed:
+            return None
+        best_val = -float('inf')
+        best_actions = []
+        for action in allowed:
+            val = self.get_q_value(game_state, action)
+            if val > best_val:
+                best_val = val
+                best_actions = [action]
+            elif val == best_val:
+                best_actions.append(action)
+        return random.choice(best_actions)
 
+    def update(self, game_state, action, next_state, reward):
+        features = self.get_features(game_state, action)
+        q_value = self.get_q_value(game_state, action)
+        next_max_q = self.compute_value_from_q_values(next_state)
 
-class DefensiveReflexAgent(ReflexCaptureAgent):
-    def get_features(self, game_state, action):
-        features = util.Counter()
-        successor = self.get_successor(game_state, action)
-        my_state = successor.get_agent_state(self.index)
+        difference = (reward + self.discount * next_max_q) - q_value
+
+        # --- SAFETY CLIP ---
+        # Prevent differences from being astronomical
+        if difference > 100:
+            difference = 100
+        if difference < -100:
+            difference = -100
+
+        for feature, value in features.items():
+            if feature not in self.frozen_weights:
+                new_weight = self.weights[feature] + \
+                    self.alpha * difference * value
+
+                # --- WEIGHT CLAMPING ---
+                # Force weights to stay within [-1000, 1000] to prevent explosion
+                if new_weight > 1000:
+                    new_weight = 1000
+                if new_weight < -1000:
+                    new_weight = -1000
+
+                self.weights[feature] = new_weight
+
+    def get_reward(self, game_state, next_state):
+        reward = 0
+        my_state = next_state.get_agent_state(self.index)
         my_pos = my_state.get_position()
+        prev_state = game_state.get_agent_state(self.index)
 
-        features['on_defense'] = 1
-        if my_state.is_pacman:
-            features['on_defense'] = 0
+        # SCALED DOWN REWARDS
+        score_diff = self.get_score(next_state) - self.get_score(game_state)
+        reward += score_diff * 1.0  # Reduced from 10 to 1
 
-        enemies = [successor.get_agent_state(i)
-                   for i in self.get_opponents(successor)]
-        invaders = [
-            a for a in enemies if a.is_pacman and a.get_position() is not None]
-        features['num_invaders'] = len(invaders)
-        if len(invaders) > 0:
-            dists = [self.get_maze_distance(
-                my_pos, a.get_position()) for a in invaders]
-            features['invader_distance'] = min(dists)
+        if my_state.num_carrying > prev_state.num_carrying:
+            reward += 0.5  # Reduced from 5
 
-        if action == Directions.STOP:
-            features['stop'] = 1
-        rev = Directions.REVERSE[game_state.get_agent_state(
-            self.index).configuration.direction]
-        if action == rev:
-            features['reverse'] = 1
+        if my_pos == self.start and prev_state.get_position() != self.start:
+            reward -= 5.0  # Reduced from 50
 
-        return features
+        return reward
 
-    def get_weights(self, game_state, action):
-        return {'num_invaders': -1000, 'on_defense': 100, 'invader_distance': -10, 'stop': -100, 'reverse': -2}
+    def choose_action(self, game_state):
+        actions = game_state.get_legal_actions(self.index)
+
+        if self.last_state and self.last_action:
+            reward = self.get_reward(self.last_state, game_state)
+            self.update(self.last_state, self.last_action, game_state, reward)
+
+        if util.flip_coin(self.epsilon):
+            action = random.choice(actions)
+        else:
+            action = self.compute_action_from_q_values(game_state)
+
+        self.last_state = game_state
+        self.last_action = action
+        return action
+
+    def final(self, game_state):
+        if self.last_state and self.last_action:
+            reward = self.get_reward(self.last_state, game_state)
+            self.update(self.last_state, self.last_action, game_state, reward)
+        self.save_weights()
+        self.episodes_so_far += 1
+        self.won_games += 1 if self.get_score(game_state) > 0 else 0
+        self.lost_games += 1 if self.get_score(game_state) <= 0 else 0
+        self.scores.append(self.get_score(game_state))
+
+        if self.episodes_so_far % 10 == 0:
+            print(
+                f"Game Over. Weights saved. Score: {self.get_score(game_state)}")
+
+            print(
+                f"Total Games so far: {self.episodes_so_far}, Wins: {self.won_games}, Losses: {self.lost_games}")
+            print(
+                f"Average Score over last {self.episodes_so_far} games: {sum(self.scores)/len(self.scores):.2f}")
+        CaptureAgent.final(self, game_state)

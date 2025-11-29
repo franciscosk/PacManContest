@@ -1,1 +1,12 @@
-{'bias': nan, 'closest_food': nan, 'eat_food': 20.0, 'carrying': 0.0, 'go_home': -5.0, 'eat_capsule': 50.0, 'ghost_far': 0.0, 'reverse': nan, 'revisit': nan, 'ghost_1_step': -1000.0, 'ghost_2_steps': -1000.0, 'trapped_location': -5000.0, 'stop': -100.0}
+{
+    "bias": 1.0,
+    "score": 0.5,
+    "food_eaten": 2.0,
+    "stop": -5.0,
+    "reverse": -0.5,
+    "distance_to_food": -3.445073373866321,
+    "distance_to_ghost": 1.809205073005237,
+    "invader_distance": -2.6244764210050113,
+    "num_invaders": -0.656797749879814,
+    "food_remaining": -1.2127632449279864
+}
