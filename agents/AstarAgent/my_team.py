@@ -62,9 +62,25 @@ class SmartQLearningAgent(CaptureAgent):
         # Compute midline for home return logic
         self.compute_home_positions(game_state)
 
+        # --------------- NEW: helper defensive agent ---------------
+        # This is a *local* DefensiveAgent the offensive agent can use
+        # when it needs to help on defence.
+        # if needed; or just use DefensiveAgent directly
+
+        self.defence_helper = DefensiveAgent(self.index)
+        # Make sure it has correct team info & distancer:
+        self.defence_helper.red = self.red
+        self.defence_helper.distancer = self.distancer
+        # Let it initialize its own internal state (patrol points etc.)
+        self.defence_helper.register_initial_state(game_state)
+
+        # Flag: are we currently helping defence?
+        self.assist_defence_mode = False
+
     # ============================================================
     # ======================  DEFAULT WEIGHTS  ====================
     # ============================================================
+
     def load_weights(self):
         """Load weights from file if it exists."""
         if WEIGHTS_FILE.exists() and WEIGHTS_FILE.stat().st_size > 0 and not FINAL_TOURNAMENT_MODE:
@@ -127,7 +143,7 @@ class SmartQLearningAgent(CaptureAgent):
 
     def tournament_weights(self):
 
-        # Win rate 18/20
+        # Win rate 34/50
         return util.Counter(
             {'bias': 10.639563957226187, 'successor_score': 90.06016879131758, 'distance_to_food': -1.036163350155402,
                 'local_food_cluster': 2.227773197857241, 'ghost_proximity': -800.0, 'stop': -100.0, 'reverse': -3.0}
@@ -153,37 +169,26 @@ class SmartQLearningAgent(CaptureAgent):
             not e.is_pacman) and e.get_position() is not None]
 
         # Check capsule power mode (scared ghosts)
-        power_mode = any(e.scared_timer > 0 for e in defenders)
+        POWER_MODE_TIMER_THRESHOLD = 2  # tweak as needed
+        # He needs 2 seconds to get out of danger after power expires!
+
+        power_mode = any(
+            e.scared_timer > POWER_MODE_TIMER_THRESHOLD for e in defenders)
 
         # Distance to dangerous (non-scared) ghosts
         dangerous = [e for e in defenders if e.scared_timer == 0]
         min_ghost_dist = self.get_min_ghost_distance(
             game_state, my_pos, dangerous)
 
+        action = self.offensive_to_defensive_Mode(game_state)
+        if action is not None:
+            self.record_transition(game_state, action)
+            return action
+
         # ====================== Capsula as savior? ======================
-
-        capusales = self.get_capsules(game_state)
-        if capusales:
-            # Find closest capsule
-            closest_cap, min_cap_dist = None, None
-            for c in capusales:
-                try:
-                    d = self.get_maze_distance(my_pos, c)
-                except:
-                    d = util.manhattan_distance(my_pos, c)
-
-                if min_cap_dist is None or d < min_cap_dist:
-                    min_cap_dist = d
-                    closest_cap = c
-
-            # If enemy very close and capsule closer than enemy → go for it
-            if min_ghost_dist is not None and min_ghost_dist <= 5 and min_cap_dist is not None and min_cap_dist < min_ghost_dist:
-                action = self.go_toward_position_action(
-                    game_state, closest_cap)
-                if action is not None:
-                    self.record_transition(game_state, action)
-                    return action
-
+        action = self.capsular_nearby(game_state, my_pos, min_ghost_dist)
+        if action is not None:
+            return action
         # --------------------------------------------------------
         # Emergency retreat: enemy very close & not powered
         # --------------------------------------------------------
@@ -194,32 +199,11 @@ class SmartQLearningAgent(CaptureAgent):
                 return safe_action
 
         # --------------------------------------------------------
-    # ========================STRATEGIC RETREAT LOGIC==========================
-
-         # 1) Retreat carry threshold based on remaining food
-        if food_left >= 20:
-            retreat_carry_threshold = 3
-        elif food_left >= 10:
-            retreat_carry_threshold = 2
-        else:
-            retreat_carry_threshold = 1  # endgame safety
-
-        # 2) Danger radius grows as agent carries more food
-        danger_radius = 3 + min(carrying, 2)  # ranges 3 → 5
-
-        # 3) Apply retreat rule ONLY when NOT powered
-        retreat = (
-            not power_mode
-            and carrying >= retreat_carry_threshold
-            and min_ghost_dist is not None
-            and min_ghost_dist <= danger_radius
-        )
-
-        if retreat:
-            action = self.go_home_action(game_state)
-            self.record_transition(game_state, action)
+      # ========================STRATEGIC RETREAT LOGIC==========================
+        action = self.strategic_retreat(game_state, power_mode,
+                                        carrying, food_left, min_ghost_dist)
+        if action is not None:
             return action
-
         # --------------------------------------------------------
         # Q-LEARNING ACTION SELECTION
         # --------------------------------------------------------
@@ -269,6 +253,231 @@ class SmartQLearningAgent(CaptureAgent):
                 best_actions.append(a)
 
         return random.choice(best_actions) if best_actions else None
+
+    # helpper
+
+    def offensive_to_defensive_Mode(self, game_state):
+        """
+        Decide whether this offensive agent should temporarily switch
+        to defensive behaviour (using self.defence_helper).
+
+        Returns:
+            - An action (string) if we are in defence mode and let the
+            helper choose the move.
+            - None if we stay in normal offensive / Q-learning mode.
+        """
+
+        import math
+
+        # Ensure the flag exists (in case of hot reload)
+        if not hasattr(self, "assist_defence_mode"):
+            self.assist_defence_mode = False
+
+        my_state = game_state.get_agent_state(self.index)
+        my_pos = my_state.get_position()
+
+        # --- Basic game info ---
+
+        # Are we losing? By how much?
+        score = self.get_score(game_state)
+        losing = score < 0
+        losing_by = -score if losing else 0
+
+        # Time left (if the framework exposes it)
+        time_left = None
+        if hasattr(game_state, "data") and hasattr(game_state.data, "timeleft"):
+            time_left = game_state.data.timeleft
+
+        # Consider "late game" if little time is left
+        late_game = (time_left is not None and time_left < 200)  # tweak
+
+        # Food near me (to measure offensive opportunity)
+        food_positions = self.get_food(game_state).as_list()
+        if food_positions:
+            dist_to_closest_food = min(
+                self.distancer.get_distance(my_pos, fpos)
+                for fpos in food_positions
+            )
+            local_food_count = sum(
+                1 for fpos in food_positions
+                if self.distancer.get_distance(my_pos, fpos) <= 3
+            )
+        else:
+            dist_to_closest_food = float("inf")
+            local_food_count = 0
+
+        # --- Enemy info ---
+
+        enemy_indices = self.get_opponents(game_state)
+        enemy_states = [game_state.get_agent_state(i) for i in enemy_indices]
+
+        # Invaders: enemies on our side (Pacman) with known position
+        invaders = [e for e in enemy_states
+                    if e.is_pacman and e.get_position() is not None]
+
+        # How much food they are carrying in total
+        total_carried = sum(getattr(e, "num_carrying", 0) for e in invaders)
+
+        # Distance to closest invader (if any)
+        if invaders:
+            dist_to_closest_invader = min(
+                self.distancer.get_distance(my_pos, e.get_position())
+                for e in invaders
+            )
+        else:
+            dist_to_closest_invader = None
+
+        # Thresholds
+        CRITICAL_STOLEN_HARD = 10   # always panic if someone has this much
+        MODERATE_STOLEN = 3         # moderate threat level
+
+        # Invaders that currently carry a lot of our food
+        dangerous_invaders = [
+            e for e in invaders
+            if getattr(e, "num_carrying", 0) >= CRITICAL_STOLEN_HARD
+        ]
+
+        # --- Update assist_defence_mode flag ---
+
+        if self.assist_defence_mode:
+            # Once we start helping, we STAY in defence mode until
+            # there is NO invader carrying any food on our side.
+            still_threat = any(getattr(e, "num_carrying", 0)
+                               > 0 for e in invaders)
+            if not still_threat:
+                # Invader killed or scored / left our side
+                self.assist_defence_mode = False
+
+        else:
+            # Not currently helping — decide if we should switch
+
+            should_help = False
+
+            # 1) Absolutely critical case: someone stole a lot
+            if len(dangerous_invaders) > 0:
+                should_help = True
+
+            # 2) Moderate threat: invaders carrying some food & we are losing
+            elif total_carried >= MODERATE_STOLEN and losing:
+
+                # If late game or losing by a lot → more urgent
+                if late_game or losing_by >= 5:
+                    should_help = True
+                else:
+                    # If we are close to the invader and there isn't
+                    # a ton of easy food around us, also help.
+                    if (dist_to_closest_invader is not None and
+                            dist_to_closest_invader <= 5 and
+                            local_food_count < 3):
+                        should_help = True
+
+            # 3) Optional: add a time-pressure-only trigger:
+            # if it's very late and ANY invader is carrying food
+            if not should_help and late_game and total_carried > 0 and losing_by >= 2:
+                should_help = True
+
+            if should_help:
+                self.assist_defence_mode = True
+
+        # --- If we are in assist defence mode, act like a defender ---
+        if self.assist_defence_mode:
+            # Let our helper DefensiveAgent choose the action
+            # (so we effectively become a second defender).
+            self.defence_helper.observation_history = self.observation_history
+            action = self.defence_helper.choose_action(game_state)
+
+            # Still record this as a transition so Q-learning sees it
+            self.record_transition(game_state, action)
+            return action
+
+        # If we get here, we are NOT in defensive assist mode.
+        # Caller should continue with normal offensive logic.
+        return None
+
+    def strategic_retreat(self, game_state, power_mode, carrying, food_left, min_ghost_dist):
+        # 1) Retreat carry threshold based on remaining food
+        if food_left >= 20:
+            retreat_carry_threshold = 3
+        elif food_left >= 10:
+            retreat_carry_threshold = 2
+        else:
+            retreat_carry_threshold = 1  # endgame safety
+
+        # 2) Danger radius grows as agent carries more food
+        danger_radius = 3 + min(carrying, 4)  # ranges 3 → 7
+
+        # 3) Apply retreat rule ONLY when NOT powered
+        retreat = (
+            (not power_mode
+             and carrying >= retreat_carry_threshold
+             and min_ghost_dist is not None
+             and min_ghost_dist <= danger_radius)
+            or food_left == 0  # always retreat if no food left
+        )
+
+        if retreat:
+            action = self.go_home_action(game_state)
+            self.record_transition(game_state, action)
+            return action
+        return None
+
+    def capsular_nearby(self, game_state, my_pos, min_ghost_dist):
+        """
+        Decide whether to go for a nearby capsule.
+
+        Behaviour:
+        - If a capsule is VERY close (<= ALWAYS_TAKE_DIST), always go eat it.
+        - Else, if a ghost is close and the capsule is closer than the ghost,
+            go for the capsule as a safety move.
+        - Otherwise, do nothing (return None) and let normal logic handle food.
+
+        Returns:
+        - An action (string) if we decide to move towards a capsule.
+        - None if we don't want to prioritize capsules this turn.
+        """
+
+        capsules = self.get_capsules(game_state)
+        if not capsules:
+            return None
+
+        # --- Find closest capsule and its distance ---
+        closest_cap = None
+        min_cap_dist = None
+
+        for c in capsules:
+            try:
+                d = self.get_maze_distance(my_pos, c)
+            except Exception:
+                d = util.manhattan_distance(my_pos, c)
+
+            if min_cap_dist is None or d < min_cap_dist:
+                min_cap_dist = d
+                closest_cap = c
+
+        if closest_cap is None or min_cap_dist is None:
+            return None
+
+        # --- Rule 1: if capsule is very close, always take it ---
+        ALWAYS_TAKE_DIST = 3  # tweak: 1, 2, or 3 depending on how greedy you want to be
+        if min_cap_dist <= ALWAYS_TAKE_DIST:
+            action = self.go_toward_position_action(game_state, closest_cap)
+            if action is not None:
+                self.record_transition(game_state, action)
+                return action
+
+        # --- Rule 2: use capsule as an escape if ghost is close ---
+        if min_ghost_dist is not None:
+            DANGER_GHOST_DIST = 5  # if ghost is within this range, we care
+            if min_ghost_dist <= DANGER_GHOST_DIST and min_cap_dist < min_ghost_dist:
+                action = self.go_toward_position_action(
+                    game_state, closest_cap)
+                if action is not None:
+                    self.record_transition(game_state, action)
+                    return action
+
+        # No capsule move chosen; caller should continue with normal logic
+        return None
+
     # ============================================================
     # ==================  Q-LEARNING SUPPORT  ====================
     # ============================================================
@@ -291,7 +500,7 @@ class SmartQLearningAgent(CaptureAgent):
     def safe_update(self, state, action, next_state, reward):
         """
         Numerically safe Q-learning update with:
-        - Per-move weight change limit (step_per_move)
+        - Per-move weight change limit (step_per_move) max of change per weight per move is 0.1
         - Global clamp around initial (hand-crafted) weights (max_total_shift)
         - Frozen "safety" weights that are not learned
         """
