@@ -1,0 +1,1 @@
+{'bias': 10.639563957226187, 'successor_score': 90.06016879131758, 'distance_to_food': -1.036163350155402, 'local_food_cluster': 2.227773197857241, 'ghost_proximity': -800.0, 'stop': -100.0, 'reverse': -3.0}

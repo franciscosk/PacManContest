@@ -12,14 +12,22 @@ from util import nearest_point
 import math
 import random
 from game import Directions   # <-- ADD THIS IMPORT
+from pathlib import Path
 
 
 # ============================================================
 # ====================   TEAM GENERATOR  =====================
 # ============================================================
 
+WEIGHTS_FILE = Path(__file__).parent / 'weights.txt'
+NUM_TRAINING = 0
+FINAL_TOURNAMENT_MODE = False
+
+
 def create_team(first_index, second_index, is_red,
                 first='SmartQLearningAgent', second='DefensiveAgent', num_training=0):
+    global NUM_TRAINING
+    NUM_TRAINING = num_training
 
     return [eval(first)(first_index), eval(second)(second_index)]
 
@@ -34,10 +42,10 @@ class SmartQLearningAgent(CaptureAgent):
         super().register_initial_state(game_state)
 
         # Q-learning parameters
-        self.alpha = 0.02
+        self.alpha = 1e-5
         self.discount = 0.9
         self.epsilon = 0.05
-        self.num_training = 0
+        self.num_training = NUM_TRAINING
 
         # State tracking
         self.last_state = None
@@ -45,7 +53,11 @@ class SmartQLearningAgent(CaptureAgent):
         self.last_score = 0
 
         # Load weights (defaults only for stability)
-        self.weights = self.default_weights()
+        self.weights = None
+        self.load_weights()
+
+        self.wins = 0  # Track number of wins
+        self.losses = 0  # Track number of losses
 
         # Compute midline for home return logic
         self.compute_home_positions(game_state)
@@ -53,8 +65,54 @@ class SmartQLearningAgent(CaptureAgent):
     # ============================================================
     # ======================  DEFAULT WEIGHTS  ====================
     # ============================================================
+    def load_weights(self):
+        """Load weights from file if it exists."""
+        if WEIGHTS_FILE.exists() and WEIGHTS_FILE.stat().st_size > 0 and not FINAL_TOURNAMENT_MODE:
+            try:
+                with open(WEIGHTS_FILE, 'r') as f:
+
+                    print("Loading weights from file.")
+                    self.weights = eval(f.read())
+
+            except Exception as e:
+                print(f"Error loading weights: {e}")
+                self.weights = self.default_weights()
+        else:
+            if FINAL_TOURNAMENT_MODE:
+                print("Tournament mode: Using tournament weights. ")
+                self.weights = self.tournament_weights()
+            else:
+                print("Weights file not found or empty. Using default weights.")
+                self.weights = self.default_weights()
+
+    def final(self, game_state):
+        """Called at the end of each game to save weights."""
+
+        print("Final weights:", self.weights)
+
+        if self.get_score(game_state) > 0:
+            self.wins += 1
+        else:
+            self.losses += 1
+
+        print(f"Wins: {self.wins} out of {self.wins + self.losses} games.")
+        if self.num_training > 0:
+            try:
+                with open(WEIGHTS_FILE, 'w') as f:
+                    f.write(str(self.weights))
+                    print("Weights saved to file.")
+            except Exception as e:
+                print(f"Error saving weights: {e}")
+        CaptureAgent.final(self, game_state)
+
+
+# These were used as initial weights before training to then start the training process
+# Handcrafted weights for features!!
+
 
     def default_weights(self):
+
+        # Will be the final ones for the tournament after training!!
         return util.Counter({
             'bias': 1.0,
             'successor_score': 100.0,
@@ -66,6 +124,14 @@ class SmartQLearningAgent(CaptureAgent):
             # 'distance_to_capsule': -5.0,   # stronger incentive to move toward it
             # 'capsule_in_range': 200.0      # very high immediate value
         })
+
+    def tournament_weights(self):
+
+        # Win rate 18/20
+        return util.Counter(
+            {'bias': 10.639563957226187, 'successor_score': 90.06016879131758, 'distance_to_food': -1.036163350155402,
+                'local_food_cluster': 2.227773197857241, 'ghost_proximity': -800.0, 'stop': -100.0, 'reverse': -3.0}
+        )
 
     # ============================================================
     # ======================  CHOOSE ACTION  ======================
@@ -96,6 +162,28 @@ class SmartQLearningAgent(CaptureAgent):
 
         # ====================== Capsula as savior? ======================
 
+        capusales = self.get_capsules(game_state)
+        if capusales:
+            # Find closest capsule
+            closest_cap, min_cap_dist = None, None
+            for c in capusales:
+                try:
+                    d = self.get_maze_distance(my_pos, c)
+                except:
+                    d = util.manhattan_distance(my_pos, c)
+
+                if min_cap_dist is None or d < min_cap_dist:
+                    min_cap_dist = d
+                    closest_cap = c
+
+            # If enemy very close and capsule closer than enemy → go for it
+            if min_ghost_dist is not None and min_ghost_dist <= 5 and min_cap_dist is not None and min_cap_dist < min_ghost_dist:
+                action = self.go_toward_position_action(
+                    game_state, closest_cap)
+                if action is not None:
+                    self.record_transition(game_state, action)
+                    return action
+
         # --------------------------------------------------------
         # Emergency retreat: enemy very close & not powered
         # --------------------------------------------------------
@@ -106,14 +194,7 @@ class SmartQLearningAgent(CaptureAgent):
                 return safe_action
 
         # --------------------------------------------------------
-        # Standard retreat: carrying 3+ food or little food left
-        # BUT skip retreat if capsule (white thing) was eaten
-        # --------------------------------------------------------
-        # if not power_mode and (carrying >= 3 or food_left <= 2):
-        #     safe_action = self.go_home_action(game_state)
-        #     if safe_action is not None:
-        #         self.record_transition(game_state, safe_action)
-        #         return safe_action
+    # ========================STRATEGIC RETREAT LOGIC==========================
 
          # 1) Retreat carry threshold based on remaining food
         if food_left >= 20:
@@ -165,12 +246,38 @@ class SmartQLearningAgent(CaptureAgent):
         self.record_transition(game_state, chosen)
         return chosen
 
+    def go_toward_position_action(self, game_state, target_pos):
+        """Choose the best move to move toward a specific target position."""
+        legal = game_state.get_legal_actions(self.index)
+        best_actions = []
+        best_dist = float('inf')
+
+        for a in legal:
+            successor = self.get_successor(game_state, a)
+            s_pos = nearest_point(
+                successor.get_agent_state(self.index).get_position())
+
+            try:
+                d = self.get_maze_distance(s_pos, target_pos)
+            except:
+                d = util.manhattan_distance(s_pos, target_pos)
+
+            if d < best_dist:
+                best_dist = d
+                best_actions = [a]
+            elif d == best_dist:
+                best_actions.append(a)
+
+        return random.choice(best_actions) if best_actions else None
     # ============================================================
     # ==================  Q-LEARNING SUPPORT  ====================
     # ============================================================
 
     def record_transition(self, game_state, action):
         """Tracks state/action history and applies incremental Q-update."""
+
+        ## ONLY IF YOU ARE IN TRAINING MODE!!!###
+
         if self.last_state is not None and self.last_action is not None and self.num_training > 0:
             reward = self.get_score(game_state) - self.last_score
             self.safe_update(self.last_state, self.last_action,
@@ -179,38 +286,102 @@ class SmartQLearningAgent(CaptureAgent):
         self.last_action = action
         self.last_score = self.get_score(game_state)
 
-    # ------------------------ SAFE UPDATE ------------------------
+        # ------------------------ SAFE UPDATE ------------------------
 
     def safe_update(self, state, action, next_state, reward):
-        """Numerically safe Q-learning update (never produces NaN)."""
+        """
+        Numerically safe Q-learning update with:
+        - Per-move weight change limit (step_per_move)
+        - Global clamp around initial (hand-crafted) weights (max_total_shift)
+        - Frozen "safety" weights that are not learned
+        """
 
-        # Compute max_a' Q(s', a')
+        import math
+
+        # One-time snapshot of the initial (hand-crafted / loaded) weights
+        self.initial_weights = self.default_weights()
+
+        # --- 1. Compute V(s') = max_a' Q(s', a') ---
         next_actions = next_state.get_legal_actions(self.index)
+
         q_next_values = []
         for a in next_actions:
-            val = self.evaluate(next_state, a)
-            if math.isfinite(val):
-                q_next_values.append(val)
+            q_val = self.evaluate(next_state, a)
+            if math.isfinite(q_val):
+                q_next_values.append(q_val)
 
+        # Terminal state: no legal actions => value 0
         max_next_q = max(q_next_values) if q_next_values else 0.0
 
-        # Current Q(s,a)
+        # --- 2. Current Q(s, a) ---
         current_q = self.evaluate(state, action)
         if not math.isfinite(current_q):
             current_q = 0.0
 
-        # TD target
+        # --- 3. TD error δ = [R + γ max_a' Q(s', a')] - Q(s, a) ---
         target = reward + self.discount * max_next_q
         difference = target - current_q
-
         if not math.isfinite(difference):
-            return  # Skip bad update
+            return  # skip bad numerics
 
-        # Update weights
+        # --- 4. Weight update with safety constraints ---
+
+        # Weights we do NOT want to change (keep strong safety behaviour)
+        FROZEN_WEIGHTS = {"ghost_proximity", "stop", "reverse"}
+
+        # Weights that must stay <= 0
+        CONSTRAINED_NEGATIVE = {"distance_to_food"}
+
+        # Max change per *move* (per call to safe_update) for any single weight
+        # Maybe make it even smaller!
+        step_per_move = 0.1
+
+        # Max total drift allowed from the initial (hand-crafted) weight
+        max_total_shift = 10.0
+
         features = self.get_features(state, action)
+
         for f, v in features.items():
-            if math.isfinite(v):
-                self.weights[f] += self.alpha * difference * v
+            # Skip frozen weights entirely
+            if f in FROZEN_WEIGHTS:
+                continue
+
+            # Skip non-finite feature values
+            if not math.isfinite(v):
+                continue
+
+            # Standard linear Q-learning update term: α * δ * feature_value
+            raw_update = self.alpha * difference * v
+            if not math.isfinite(raw_update):
+                continue
+
+            # --- Per-move clipping: limit the *update* size ---
+            if raw_update > step_per_move:
+                raw_update = step_per_move
+            elif raw_update < -step_per_move:
+                raw_update = -step_per_move
+
+            # --- Global clamp around initial weight ---
+            base_w = self.initial_weights.get(f, 0.0)
+            current_w = self.weights.get(f, base_w)
+
+            proposed = current_w + raw_update
+
+            lower_global = base_w - max_total_shift
+            upper_global = base_w + max_total_shift
+
+            if proposed > upper_global:
+                new_weight = upper_global
+            elif proposed < lower_global:
+                new_weight = lower_global
+            else:
+                new_weight = proposed
+
+            # Enforce negativity for certain features
+            if f in CONSTRAINED_NEGATIVE and new_weight > 0.0:
+                new_weight = -2.0  # small negative value
+
+            self.weights[f] = new_weight
 
     # ============================================================
     # ====================  FEATURE EXTRACTOR  ====================
@@ -409,8 +580,7 @@ class DefensiveAgent(CaptureAgent):
         enemies = [state.get_agent_state(i) for i in self.get_opponents(state)]
         invaders = [e for e in enemies if e.is_pacman and e.get_position()]
 
-        scared = my_state.scared_timer > 0
-
+        scared = my_state.scared_timer > 2
         # ------------------------------------------------------
         # SCARED: Avoid invaders
         # ------------------------------------------------------
