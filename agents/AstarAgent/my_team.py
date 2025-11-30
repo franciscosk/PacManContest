@@ -11,7 +11,7 @@ import util
 from util import nearest_point
 import math
 import random
-from game import Directions   # <-- ADD THIS IMPORT
+from game import Directions
 from pathlib import Path
 
 
@@ -26,6 +26,10 @@ FINAL_TOURNAMENT_MODE = False
 
 def create_team(first_index, second_index, is_red,
                 first='SmartQLearningAgent', second='DefensiveAgent', num_training=0):
+    """
+    Factory to create the team for the framework.
+    Keeps the original signature and behaviour.
+    """
     global NUM_TRAINING
     NUM_TRAINING = num_training
 
@@ -33,77 +37,98 @@ def create_team(first_index, second_index, is_red,
 
 
 # ============================================================
-# ====================   MAIN AGENT CLASS  ====================
+# ====================   MAIN AGENT CLASS  ===================
 # ============================================================
 
 class SmartQLearningAgent(CaptureAgent):
+    """
+    Offensive Q-learning agent with:
+    - Safety and retreat logic
+    - Capsule prioritization
+    - Optional defensive assistance through DefensiveAgent
+    """
+
+    # --------------------------------------------------------
+    # Initialisation / setup
+    # --------------------------------------------------------
 
     def register_initial_state(self, game_state):
+        """
+        Called by the framework once at the beginning.
+        Sets up learning parameters, loads weights, and prepares helpers.
+        """
         super().register_initial_state(game_state)
 
-        # Q-learning parameters
-        self.alpha = 1e-5
-        self.discount = 0.9
-        self.epsilon = 0.05
-        self.num_training = NUM_TRAINING
-
-        # State tracking
-        self.last_state = None
-        self.last_action = None
-        self.last_score = 0
+        self._init_learning_parameters()
+        self._init_state_tracker()
 
         # Load weights (defaults only for stability)
         self.weights = None
         self.load_weights()
 
-        self.wins = 0  # Track number of wins
-        self.losses = 0  # Track number of losses
+        # Snapshot of starting weights for safe_update clamping
+        self.initial_weights = self.weights.copy()
 
         # Compute midline for home return logic
         self.compute_home_positions(game_state)
 
-        # --------------- NEW: helper defensive agent ---------------
-        # This is a *local* DefensiveAgent the offensive agent can use
-        # when it needs to help on defence.
-        # if needed; or just use DefensiveAgent directly
+        # Helper defensive agent and mode flag
+        self._init_defence_helper(game_state)
 
+    def _init_learning_parameters(self):
+        """Initialize Q-learning hyperparameters."""
+        self.alpha = 1e-5
+        self.discount = 0.9
+        self.epsilon = 0.05
+        self.num_training = NUM_TRAINING
+
+    def _init_state_tracker(self):
+        """Initialize tracking of last transition and simple stats."""
+        self.last_state = None
+        self.last_action = None
+        self.last_score = 0
+
+        # Track number of wins / losses during training runs
+        self.wins = 0
+        self.losses = 0
+
+    def _init_defence_helper(self, game_state):
+        """
+        Create a local DefensiveAgent helper that this agent can
+        temporarily delegate to when assisting on defence.
+        """
         self.defence_helper = DefensiveAgent(self.index)
-        # Make sure it has correct team info & distancer:
         self.defence_helper.red = self.red
         self.defence_helper.distancer = self.distancer
-        # Let it initialize its own internal state (patrol points etc.)
         self.defence_helper.register_initial_state(game_state)
 
-        # Flag: are we currently helping defence?
+        # Flag: are we currently helping on defence?
         self.assist_defence_mode = False
 
     # ============================================================
-    # ======================  DEFAULT WEIGHTS  ====================
+    # ======================  WEIGHTS LOGIC  =====================
     # ============================================================
 
     def load_weights(self):
-        """Load weights from file if it exists."""
+        """Load weights from file if it exists, or fall back to defaults/tournament."""
         if WEIGHTS_FILE.exists() and WEIGHTS_FILE.stat().st_size > 0 and not FINAL_TOURNAMENT_MODE:
             try:
                 with open(WEIGHTS_FILE, 'r') as f:
-
                     print("Loading weights from file.")
                     self.weights = eval(f.read())
-
             except Exception as e:
                 print(f"Error loading weights: {e}")
                 self.weights = self.default_weights()
         else:
             if FINAL_TOURNAMENT_MODE:
-                print("Tournament mode: Using tournament weights. ")
+                print("Tournament mode: Using tournament weights.")
                 self.weights = self.tournament_weights()
             else:
                 print("Weights file not found or empty. Using default weights.")
                 self.weights = self.default_weights()
 
     def final(self, game_state):
-        """Called at the end of each game to save weights."""
-
+        """Called at the end of each game to log and optionally save weights."""
         print("Final weights:", self.weights)
 
         if self.get_score(game_state) > 0:
@@ -112,6 +137,8 @@ class SmartQLearningAgent(CaptureAgent):
             self.losses += 1
 
         print(f"Wins: {self.wins} out of {self.wins + self.losses} games.")
+
+        # Only persist weights while in training mode
         if self.num_training > 0:
             try:
                 with open(WEIGHTS_FILE, 'w') as f:
@@ -119,16 +146,12 @@ class SmartQLearningAgent(CaptureAgent):
                     print("Weights saved to file.")
             except Exception as e:
                 print(f"Error saving weights: {e}")
+
         CaptureAgent.final(self, game_state)
 
-
-# These were used as initial weights before training to then start the training process
-# Handcrafted weights for features!!
-
-
+    # Handcrafted initial weights for features
     def default_weights(self):
-
-        # Will be the final ones for the tournament after training!!
+        # Will be the starting point before training.
         return util.Counter({
             'bias': 1.0,
             'successor_score': 100.0,
@@ -137,23 +160,33 @@ class SmartQLearningAgent(CaptureAgent):
             'ghost_proximity': -800.0,
             'stop': -100.0,
             'reverse': -3.0,
-            # 'distance_to_capsule': -5.0,   # stronger incentive to move toward it
-            # 'capsule_in_range': 200.0      # very high immediate value
         })
 
     def tournament_weights(self):
-
-        # Win rate 34/50
-        return util.Counter(
-            {'bias': 10.639563957226187, 'successor_score': 90.06016879131758, 'distance_to_food': -1.036163350155402,
-                'local_food_cluster': 2.227773197857241, 'ghost_proximity': -800.0, 'stop': -100.0, 'reverse': -3.0}
-        )
+        # Win rate 34/50 (these were trained externally)
+        return util.Counter({
+            'bias': 8.761410733666864,
+            'successor_score': 90.0,
+            'distance_to_food': -1.5572172875342591,
+            'local_food_cluster': 14.722072774648437,
+            'ghost_proximity': -800.0,
+            'stop': -100.0,
+            'reverse': -3.0,
+        })
 
     # ============================================================
-    # ======================  CHOOSE ACTION  ======================
+    # ======================  CHOOSE ACTION  =====================
     # ============================================================
 
     def choose_action(self, game_state):
+        """
+        Main decision function:
+        1) Maybe switch to defensive helper.
+        2) Capsule rescue logic.
+        3) Emergency retreat.
+        4) Strategic retreat.
+        5) Q-learning action selection (ε-greedy).
+        """
         # --------------------------------------------------------
         # Extract useful state info
         # --------------------------------------------------------
@@ -169,9 +202,7 @@ class SmartQLearningAgent(CaptureAgent):
             not e.is_pacman) and e.get_position() is not None]
 
         # Check capsule power mode (scared ghosts)
-        POWER_MODE_TIMER_THRESHOLD = 2  # tweak as needed
-        # He needs 2 seconds to get out of danger after power expires!
-
+        POWER_MODE_TIMER_THRESHOLD = 2  # needs time to retreat after power ends
         power_mode = any(
             e.scared_timer > POWER_MODE_TIMER_THRESHOLD for e in defenders)
 
@@ -180,17 +211,24 @@ class SmartQLearningAgent(CaptureAgent):
         min_ghost_dist = self.get_min_ghost_distance(
             game_state, my_pos, dangerous)
 
+        # --------------------------------------------------------
+        # 1) Optionally switch to defensive helper
+        # --------------------------------------------------------
         action = self.offensive_to_defensive_Mode(game_state)
         if action is not None:
             self.record_transition(game_state, action)
             return action
 
-        # ====================== Capsula as savior? ======================
+        # --------------------------------------------------------
+        # 2) Capsule as saviour?
+        # --------------------------------------------------------
         action = self.capsular_nearby(game_state, my_pos, min_ghost_dist)
         if action is not None:
+            self.record_transition(game_state, action)
             return action
+
         # --------------------------------------------------------
-        # Emergency retreat: enemy very close & not powered
+        # 3) Emergency retreat: enemy very close & not powered
         # --------------------------------------------------------
         if not power_mode and min_ghost_dist is not None and min_ghost_dist <= 3:
             safe_action = self.go_home_action(game_state)
@@ -199,21 +237,24 @@ class SmartQLearningAgent(CaptureAgent):
                 return safe_action
 
         # --------------------------------------------------------
-      # ========================STRATEGIC RETREAT LOGIC==========================
+        # 4) Strategic retreat logic
+        # --------------------------------------------------------
         action = self.strategic_retreat(game_state, power_mode,
                                         carrying, food_left, min_ghost_dist)
         if action is not None:
+            self.record_transition(game_state, action)
             return action
+
         # --------------------------------------------------------
-        # Q-LEARNING ACTION SELECTION
+        # 5) Q-LEARNING ACTION SELECTION (ε-greedy)
         # --------------------------------------------------------
         legal_actions = game_state.get_legal_actions(self.index)
 
         # ε-greedy random exploration
         if self.num_training > 0 and random.random() < self.epsilon:
-            a = random.choice(legal_actions)
-            self.record_transition(game_state, a)
-            return a
+            action = random.choice(legal_actions)
+            self.record_transition(game_state, action)
+            return action
 
         # Exploitation: choose best Q-value
         best_actions = []
@@ -230,6 +271,10 @@ class SmartQLearningAgent(CaptureAgent):
         self.record_transition(game_state, chosen)
         return chosen
 
+    # --------------------------------------------------------
+    # Movement helpers
+    # --------------------------------------------------------
+
     def go_toward_position_action(self, game_state, target_pos):
         """Choose the best move to move toward a specific target position."""
         legal = game_state.get_legal_actions(self.index)
@@ -240,11 +285,7 @@ class SmartQLearningAgent(CaptureAgent):
             successor = self.get_successor(game_state, a)
             s_pos = nearest_point(
                 successor.get_agent_state(self.index).get_position())
-
-            try:
-                d = self.get_maze_distance(s_pos, target_pos)
-            except:
-                d = util.manhattan_distance(s_pos, target_pos)
+            d = self.safe_maze_distance(s_pos, target_pos)
 
             if d < best_dist:
                 best_dist = d
@@ -254,7 +295,19 @@ class SmartQLearningAgent(CaptureAgent):
 
         return random.choice(best_actions) if best_actions else None
 
-    # helpper
+    def safe_maze_distance(self, pos1, pos2):
+        """
+        Helper: maze distance with Manhattan fallback.
+        Logic equivalent to try/except blocks used previously.
+        """
+        try:
+            return self.get_maze_distance(pos1, pos2)
+        except Exception:
+            return util.manhattan_distance(pos1, pos2)
+
+    # --------------------------------------------------------
+    # Offensive ↔ Defensive mode logic
+    # --------------------------------------------------------
 
     def offensive_to_defensive_Mode(self, game_state):
         """
@@ -263,11 +316,9 @@ class SmartQLearningAgent(CaptureAgent):
 
         Returns:
             - An action (string) if we are in defence mode and let the
-            helper choose the move.
+              helper choose the move.
             - None if we stay in normal offensive / Q-learning mode.
         """
-
-        import math
 
         # Ensure the flag exists (in case of hot reload)
         if not hasattr(self, "assist_defence_mode"):
@@ -277,8 +328,6 @@ class SmartQLearningAgent(CaptureAgent):
         my_pos = my_state.get_position()
 
         # --- Basic game info ---
-
-        # Are we losing? By how much?
         score = self.get_score(game_state)
         losing = score < 0
         losing_by = -score if losing else 0
@@ -289,7 +338,7 @@ class SmartQLearningAgent(CaptureAgent):
             time_left = game_state.data.timeleft
 
         # Consider "late game" if little time is left
-        late_game = (time_left is not None and time_left < 200)  # tweak
+        late_game = (time_left is not None and time_left < 200)
 
         # Food near me (to measure offensive opportunity)
         food_positions = self.get_food(game_state).as_list()
@@ -307,7 +356,6 @@ class SmartQLearningAgent(CaptureAgent):
             local_food_count = 0
 
         # --- Enemy info ---
-
         enemy_indices = self.get_opponents(game_state)
         enemy_states = [game_state.get_agent_state(i) for i in enemy_indices]
 
@@ -350,7 +398,6 @@ class SmartQLearningAgent(CaptureAgent):
 
         else:
             # Not currently helping — decide if we should switch
-
             should_help = False
 
             # 1) Absolutely critical case: someone stole a lot
@@ -359,7 +406,6 @@ class SmartQLearningAgent(CaptureAgent):
 
             # 2) Moderate threat: invaders carrying some food & we are losing
             elif total_carried >= MODERATE_STOLEN and losing:
-
                 # If late game or losing by a lot → more urgent
                 if late_game or losing_by >= 5:
                     should_help = True
@@ -371,9 +417,9 @@ class SmartQLearningAgent(CaptureAgent):
                             local_food_count < 3):
                         should_help = True
 
-            # 3) Optional: add a time-pressure-only trigger:
-            # if it's very late and ANY invader is carrying food
-            if not should_help and late_game and total_carried > 0 and losing_by >= 2:
+            # 3) Optional: time-pressure-only trigger:
+            if (not should_help and late_game and total_carried > 0 and
+                    losing_by >= 2):
                 should_help = True
 
             if should_help:
@@ -382,19 +428,25 @@ class SmartQLearningAgent(CaptureAgent):
         # --- If we are in assist defence mode, act like a defender ---
         if self.assist_defence_mode:
             # Let our helper DefensiveAgent choose the action
-            # (so we effectively become a second defender).
             self.defence_helper.observation_history = self.observation_history
             action = self.defence_helper.choose_action(game_state)
-
-            # Still record this as a transition so Q-learning sees it
-            self.record_transition(game_state, action)
             return action
 
         # If we get here, we are NOT in defensive assist mode.
         # Caller should continue with normal offensive logic.
         return None
 
+    # --------------------------------------------------------
+    # Strategic retreat + capsule logic
+    # --------------------------------------------------------
+
     def strategic_retreat(self, game_state, power_mode, carrying, food_left, min_ghost_dist):
+        """
+        Decide whether to retreat home based on:
+        - Carried food
+        - Remaining food
+        - Ghost distance
+        """
         # 1) Retreat carry threshold based on remaining food
         if food_left >= 20:
             retreat_carry_threshold = 3
@@ -416,9 +468,7 @@ class SmartQLearningAgent(CaptureAgent):
         )
 
         if retreat:
-            action = self.go_home_action(game_state)
-            self.record_transition(game_state, action)
-            return action
+            return self.go_home_action(game_state)
         return None
 
     def capsular_nearby(self, game_state, my_pos, min_ghost_dist):
@@ -428,14 +478,13 @@ class SmartQLearningAgent(CaptureAgent):
         Behaviour:
         - If a capsule is VERY close (<= ALWAYS_TAKE_DIST), always go eat it.
         - Else, if a ghost is close and the capsule is closer than the ghost,
-            go for the capsule as a safety move.
+          go for the capsule as a safety move.
         - Otherwise, do nothing (return None) and let normal logic handle food.
 
         Returns:
         - An action (string) if we decide to move towards a capsule.
         - None if we don't want to prioritize capsules this turn.
         """
-
         capsules = self.get_capsules(game_state)
         if not capsules:
             return None
@@ -445,10 +494,7 @@ class SmartQLearningAgent(CaptureAgent):
         min_cap_dist = None
 
         for c in capsules:
-            try:
-                d = self.get_maze_distance(my_pos, c)
-            except Exception:
-                d = util.manhattan_distance(my_pos, c)
+            d = self.safe_maze_distance(my_pos, c)
 
             if min_cap_dist is None or d < min_cap_dist:
                 min_cap_dist = d
@@ -458,22 +504,15 @@ class SmartQLearningAgent(CaptureAgent):
             return None
 
         # --- Rule 1: if capsule is very close, always take it ---
-        ALWAYS_TAKE_DIST = 3  # tweak: 1, 2, or 3 depending on how greedy you want to be
+        ALWAYS_TAKE_DIST = 3
         if min_cap_dist <= ALWAYS_TAKE_DIST:
-            action = self.go_toward_position_action(game_state, closest_cap)
-            if action is not None:
-                self.record_transition(game_state, action)
-                return action
+            return self.go_toward_position_action(game_state, closest_cap)
 
         # --- Rule 2: use capsule as an escape if ghost is close ---
         if min_ghost_dist is not None:
-            DANGER_GHOST_DIST = 5  # if ghost is within this range, we care
+            DANGER_GHOST_DIST = 5
             if min_ghost_dist <= DANGER_GHOST_DIST and min_cap_dist < min_ghost_dist:
-                action = self.go_toward_position_action(
-                    game_state, closest_cap)
-                if action is not None:
-                    self.record_transition(game_state, action)
-                    return action
+                return self.go_toward_position_action(game_state, closest_cap)
 
         # No capsule move chosen; caller should continue with normal logic
         return None
@@ -483,32 +522,31 @@ class SmartQLearningAgent(CaptureAgent):
     # ============================================================
 
     def record_transition(self, game_state, action):
-        """Tracks state/action history and applies incremental Q-update."""
-
-        ## ONLY IF YOU ARE IN TRAINING MODE!!!###
-
+        """
+        Tracks state/action history and applies incremental Q-update.
+        Ensures exactly one update per chosen action while training.
+        """
+        # Only if we are in training mode
         if self.last_state is not None and self.last_action is not None and self.num_training > 0:
             reward = self.get_score(game_state) - self.last_score
             self.safe_update(self.last_state, self.last_action,
                              game_state, reward)
+
         self.last_state = game_state
         self.last_action = action
         self.last_score = self.get_score(game_state)
 
-        # ------------------------ SAFE UPDATE ------------------------
-
     def safe_update(self, state, action, next_state, reward):
         """
         Numerically safe Q-learning update with:
-        - Per-move weight change limit (step_per_move) max of change per weight per move is 0.1
-        - Global clamp around initial (hand-crafted) weights (max_total_shift)
+        - Per-move weight change limit (step_per_move)
+        - Global clamp around initial weights (max_total_shift)
         - Frozen "safety" weights that are not learned
         """
 
-        import math
-
-        # One-time snapshot of the initial (hand-crafted / loaded) weights
-        self.initial_weights = self.default_weights()
+        # Ensure we have an initial snapshot of the starting weights
+        if not hasattr(self, "initial_weights"):
+            self.initial_weights = self.weights.copy()
 
         # --- 1. Compute V(s') = max_a' Q(s', a') ---
         next_actions = next_state.get_legal_actions(self.index)
@@ -542,10 +580,9 @@ class SmartQLearningAgent(CaptureAgent):
         CONSTRAINED_NEGATIVE = {"distance_to_food"}
 
         # Max change per *move* (per call to safe_update) for any single weight
-        # Maybe make it even smaller!
         step_per_move = 0.1
 
-        # Max total drift allowed from the initial (hand-crafted) weight
+        # Max total drift allowed from the initial (hand-crafted / loaded) weight
         max_total_shift = 10.0
 
         features = self.get_features(state, action)
@@ -593,10 +630,19 @@ class SmartQLearningAgent(CaptureAgent):
             self.weights[f] = new_weight
 
     # ============================================================
-    # ====================  FEATURE EXTRACTOR  ====================
+    # ====================  FEATURE EXTRACTOR  ===================
     # ============================================================
 
     def get_features(self, game_state, action):
+        """
+        Feature extractor for Q(s,a):
+        - bias
+        - successor_score (remaining food)
+        - distance_to_food
+        - local_food_cluster
+        - ghost_proximity
+        - stop / reverse penalties
+        """
         features = util.Counter()
 
         successor = self.get_successor(game_state, action)
@@ -613,10 +659,7 @@ class SmartQLearningAgent(CaptureAgent):
             # Find closest food
             closest, min_dist = None, None
             for f in food_list:
-                try:
-                    d = self.get_maze_distance(my_pos, f)
-                except:
-                    d = util.manhattan_distance(my_pos, f)
+                d = self.safe_maze_distance(my_pos, f)
 
                 if min_dist is None or d < min_dist:
                     min_dist = d
@@ -628,35 +671,9 @@ class SmartQLearningAgent(CaptureAgent):
             cx, cy = closest
             cluster = 0
             for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
-                if (cx+dx, cy+dy) in food_list:
+                if (cx + dx, cy + dy) in food_list:
                     cluster += 1
             features['local_food_cluster'] = cluster
-
-         # Capsule-related features
-        # capsules = self.get_capsules(successor)
-        # if capsules:
-        #     # Find closest capsule
-        #     closest_cap, min_cap_dist = None, None
-        #     for c in capsules:
-        #         try:
-        #             d = self.get_maze_distance(my_pos, c)
-        #         except:
-        #             d = util.manhattan_distance(my_pos, c)
-
-        #         if min_cap_dist is None or d < min_cap_dist:
-        #             min_cap_dist = d
-        #             closest_cap = c
-
-        #     features['distance_to_capsule'] = min_cap_dist
-
-        #     # If successor position is exactly on capsule → reward heavily
-        #     if my_pos == closest_cap:
-        #         features['capsule_in_range'] = 1.0
-        #     else:
-        #         features['capsule_in_range'] = 0.0
-        # else:
-        #     features['distance_to_capsule'] = 0.0
-        #     features['capsule_in_range'] = 0.0
 
         # Ghost proximity
         defenders = [s for s in self.get_opponents_states(successor)
@@ -666,13 +683,14 @@ class SmartQLearningAgent(CaptureAgent):
         min_gdist = self.get_min_ghost_distance(successor, my_pos, dangerous)
 
         if min_gdist is not None:
+            # FIXED LOGIC: closer ghosts → larger positive penalty,
+            # combined with a negative weight in default/tournament weights.
             if min_gdist < 2:
-                features['ghost_proximity'] = -1000
+                features['ghost_proximity'] = 1000
             elif min_gdist < 5:
-                features['ghost_proximity'] = -200 * (5 - min_gdist)
+                features['ghost_proximity'] = 200 * (5 - min_gdist)
 
-        # Stop / reverse penalties
-      # Stop / reverse penalties
+        # Stop penalty
         if action == 'Stop':
             features['stop'] = 1.0
 
@@ -704,18 +722,15 @@ class SmartQLearningAgent(CaptureAgent):
         return successor
 
     # ============================================================
-    # =====================  GHOST DISTANCE  ======================
+    # =====================  GHOST DISTANCE  =====================
     # ============================================================
 
     def get_min_ghost_distance(self, game_state, my_pos, ghosts):
+        """Return the minimum distance to any ghost in the given list."""
         dists = []
         for g in ghosts:
-            try:
-                d = self.get_maze_distance(
-                    my_pos, nearest_point(g.get_position()))
-            except:
-                d = util.manhattan_distance(
-                    my_pos, nearest_point(g.get_position()))
+            d = self.safe_maze_distance(
+                my_pos, nearest_point(g.get_position()))
             dists.append(d)
         return min(dists) if dists else None
 
@@ -723,7 +738,7 @@ class SmartQLearningAgent(CaptureAgent):
         return [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
 
     # ============================================================
-    # ======================  GO HOME LOGIC  ======================
+    # ======================  GO HOME LOGIC  =====================
     # ============================================================
 
     def compute_home_positions(self, game_state):
@@ -733,7 +748,7 @@ class SmartQLearningAgent(CaptureAgent):
 
         self.home_positions = []
         for y in range(walls.height):
-            if not walls[mid][y] and not walls[mid-1][y]:
+            if not walls[mid][y] and not walls[mid - 1][y]:
                 self.home_positions.append((mid, y))
 
     def go_home_action(self, game_state):
@@ -751,10 +766,7 @@ class SmartQLearningAgent(CaptureAgent):
                 successor.get_agent_state(self.index).get_position())
 
             for home in self.home_positions:
-                try:
-                    d = self.get_maze_distance(s_pos, home)
-                except:
-                    d = util.manhattan_distance(s_pos, home)
+                d = self.safe_maze_distance(s_pos, home)
 
                 if d < best_dist:
                     best_dist = d
@@ -764,22 +776,28 @@ class SmartQLearningAgent(CaptureAgent):
 
         return random.choice(best_actions) if best_actions else None
 
- ###############################################################
+
+###############################################################
 # ======================== DEFENSIVE AGENT ====================
 ###############################################################
 
-
 class DefensiveAgent(CaptureAgent):
+    """
+    Simple defensive agent:
+    - Patrols along midline
+    - Chases visible invaders
+    - Avoids invaders when scared
+    """
 
     def register_initial_state(self, game_state):
         super().register_initial_state(game_state)
 
-        # Precompute midline patrol waypoints (Option 3)
+        # Precompute midline patrol waypoints
         self.patrol_points = self.compute_patrol_points(game_state)
         self.patrol_index = 0
 
     ###########################################################
-    # ===================== CHOOSE ACTION ======================
+    # ===================== CHOOSE ACTION =====================
     ###########################################################
 
     def choose_action(self, state):
@@ -790,6 +808,7 @@ class DefensiveAgent(CaptureAgent):
         invaders = [e for e in enemies if e.is_pacman and e.get_position()]
 
         scared = my_state.scared_timer > 2
+
         # ------------------------------------------------------
         # SCARED: Avoid invaders
         # ------------------------------------------------------
@@ -808,13 +827,13 @@ class DefensiveAgent(CaptureAgent):
         return self.patrol(state, my_pos)
 
     ###########################################################
-    # ===================== DEFENSIVE LOGIC ====================
+    # ===================== DEFENSIVE LOGIC ===================
     ###########################################################
 
     def chase_invader(self, state, my_pos, invaders):
         legal = state.get_legal_actions(self.index)
 
-        # closest invader
+        # Closest invader
         target = min(invaders, key=lambda e: self.safe_dist(
             my_pos, e.get_position(), state))
         tpos = nearest_point(target.get_position())
@@ -866,7 +885,7 @@ class DefensiveAgent(CaptureAgent):
         return random.choice(best) if best else random.choice(legal)
 
     ###########################################################
-    # ========================== PATROL =========================
+    # ========================== PATROL =======================
     ###########################################################
 
     def patrol(self, state, my_pos):
@@ -903,12 +922,12 @@ class DefensiveAgent(CaptureAgent):
         return random.choice(best_actions) if best_actions else random.choice(legal)
 
     ###########################################################
-    # ========================== UTILITIES ======================
+    # ========================== UTILITIES ====================
     ###########################################################
 
     def compute_patrol_points(self, state):
         """
-        Option 3: fixed midline waypoints
+        Option 3: fixed midline waypoints.
         """
         walls = state.get_walls()
         mid = walls.width // 2 - (1 if self.red else 0)
@@ -931,7 +950,8 @@ class DefensiveAgent(CaptureAgent):
         return points
 
     def safe_dist(self, a, b, s):
+        """Maze distance with Manhattan fallback."""
         try:
             return self.get_maze_distance(a, b)
-        except:
+        except Exception:
             return util.manhattan_distance(a, b)
