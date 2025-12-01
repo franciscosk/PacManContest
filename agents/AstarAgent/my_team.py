@@ -21,7 +21,7 @@ from pathlib import Path
 
 WEIGHTS_FILE = Path(__file__).parent / 'weights.txt'
 NUM_TRAINING = 0
-FINAL_TOURNAMENT_MODE = False
+FINAL_TOURNAMENT_MODE = True
 
 
 def create_team(first_index, second_index, is_red,
@@ -67,7 +67,10 @@ class SmartQLearningAgent(CaptureAgent):
         self.load_weights()
 
         # Snapshot of starting weights for safe_update clamping
-        self.initial_weights = self.weights.copy()
+        # Only set this ONCE per session to prevent the anchor from moving
+        # Use to avoid overwriting inital weights when using several training rounds
+        if not hasattr(self, "initial_weights"):
+            self.initial_weights = self.weights.copy()
 
         # Compute midline for home return logic
         self.compute_home_positions(game_state)
@@ -456,7 +459,8 @@ class SmartQLearningAgent(CaptureAgent):
             retreat_carry_threshold = 1  # endgame safety
 
         # 2) Danger radius grows as agent carries more food
-        danger_radius = 3 + min(carrying, 4)  # ranges 3 → 7
+        # 5 is the max visibilty range of ghosts
+        danger_radius = 3 + min(carrying, 2)  # ranges 3 → 5
 
         # 3) Apply retreat rule ONLY when NOT powered
         retreat = (
@@ -464,7 +468,7 @@ class SmartQLearningAgent(CaptureAgent):
              and carrying >= retreat_carry_threshold
              and min_ghost_dist is not None
              and min_ghost_dist <= danger_radius)
-            or food_left == 0  # always retreat if no food left
+            or food_left == 2  # always retreat if no food left or 2
         )
 
         if retreat:
